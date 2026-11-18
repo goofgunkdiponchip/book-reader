@@ -118,9 +118,9 @@ body.ready.mode-pdf #pdfwrap{display:flex}
   background:linear-gradient(90deg,transparent,rgba(0,0,0,.07) 42%,rgba(0,0,0,.16) 50%,rgba(0,0,0,.07) 58%,transparent)}
 .pg{position:relative;background:#fff}
 .pg canvas{display:block}
+/* Sepia and Night recolour a PDF's text while it is drawn (see pdfInk); pictures keep their real colours */
+:root[data-theme="sepia"] .pg,:root[data-theme="night"] .pg{background:var(--paper)}
 .hl{position:absolute;background:rgba(255,196,0,.42);border-radius:2px;pointer-events:none}
-:root[data-theme="sepia"] .pg canvas{filter:sepia(.45) brightness(.96)}
-:root[data-theme="night"] .pg canvas{filter:invert(.9) hue-rotate(180deg)}
 :root[data-theme="night"] .hl{background:rgba(255,205,60,.6)}
 
 body:not(.ready) .needs-book{display:none !important}
@@ -528,10 +528,111 @@ function loadPdfJs() {
       s.src = 'lib/pdf.min.js'; s.onload = res;
       s.onerror = () => rej(new Error("the PDF add-on didn't load. Check your connection and try again."));
       document.head.append(s);
-    }).then(() => { pdfjsLib.GlobalWorkerOptions.workerSrc = 'lib/pdf.worker.min.js'; });
+    }).then(() => { pdfjsLib.GlobalWorkerOptions.workerSrc = 'lib/pdf.worker.min.js'; hookPdfInk(); });
     pdfjsReady.catch(() => { pdfjsReady = null; });
   }
   return pdfjsReady;
+}
+
+// ---- Sepia and Night for PDFs
+// The page's text and drawings are repainted in the theme's paper and ink while PDF.js draws them, and pictures
+// keep their own colours. (A CSS invert + hue-rotate filter turned photos into garish negatives.)
+// This needs the one line added to lib/pdf.min.js that exposes CanvasGraphics as globalThis.pdfjsCanvasGraphics.
+// Without it, pages are drawn in their own colours.
+const hexRgb = h => {
+  h = h.trim().replace('#', '');
+  if (h.length === 3) h = [...h].map(c => c + c).join('');
+  const n = parseInt(h, 16);
+  return [n >> 16 & 255, n >> 8 & 255, n & 255];
+};
+const rgbHex = c => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+const toLinear = c => (c /= 255) <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+// OKLab: lightness 0 (black) to 1 (white), plus two colour axes
+function oklab(r, g, b) {
+  r = toLinear(r); g = toLinear(g); b = toLinear(b);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+          1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+          0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s];
+}
+// back to 0–255 RGB, or null if the screen can't show that colour
+function fromOklab(L, A, B) {
+  const l = (L + 0.3963377774 * A + 0.2158037573 * B) ** 3;
+  const m = (L - 0.1055613458 * A - 0.0638541728 * B) ** 3;
+  const s = (L - 0.0894841775 * A - 1.2914855480 * B) ** 3;
+  const lin = [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+              -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+              -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s];
+  if (lin.some(c => c < -0.001 || c > 1.001)) return null;
+  return lin.map(c => { c = clamp(c, 0, 1); return Math.round(255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055)); });
+}
+// White becomes the theme's paper, black its ink, and greys fall in between. Colours keep their own hue and
+// strength. Only greys take on the theme's tint, since tinting a colour on top of its own makes it too vivid.
+// The strength is eased back only when the screen can't show the result.
+function makeInk(paperHex, inkHex) {
+  const Pp = oklab(...hexRgb(paperHex)), Ik = oklab(...hexRgb(inkHex)), memo = new Map();
+  const rgb = (r, g, b) => {
+    const key = r << 16 | g << 8 | b;
+    let v = memo.get(key);
+    if (!v) {
+      const [L, A, B] = oklab(r, g, b), t = clamp(L, 0, 1), tint = 1 - clamp(Math.hypot(A, B) / 0.06, 0, 1);
+      const L2 = Ik[0] + (Pp[0] - Ik[0]) * t;
+      const A2 = (Ik[1] + (Pp[1] - Ik[1]) * t) * tint, B2 = (Ik[2] + (Pp[2] - Ik[2]) * t) * tint;
+      for (let k = 1; !v && k >= 0; k -= 0.125) v = fromOklab(L2, A2 + A * k, B2 + B * k);
+      v = v || hexRgb(t > 0.5 ? paperHex : inkHex);
+      memo.set(key, v);
+    }
+    return v;
+  };
+  return { paper: rgbHex(rgb(255, 255, 255)), ink: rgbHex(rgb(0, 0, 0)), rgb };
+}
+const INKS = {};
+// null for Paper: PDFs keep their own colours there
+function pdfInk() {
+  if (prefs.theme === 'paper') return null;
+  const cs = getComputedStyle(root);
+  return INKS[prefs.theme] ||= makeInk(cs.getPropertyValue('--paper'), cs.getPropertyValue('--ink'));
+}
+function hookPdfInk() {
+  const G = globalThis.pdfjsCanvasGraphics, OPS = pdfjsLib.OPS;
+  if (!G || !OPS || G.prototype._brInk) return;
+  const proto = G.prototype;
+  proto._brInk = true;
+  const wrap = (name, make) => {
+    const f = make(proto[name]);
+    proto[name] = f;
+    if (name in OPS) proto[OPS[name]] = f;   // PDF.js calls drawing operators by number
+  };
+  // pdfPage puts the colours on the canvas before drawing; nothing is set for Paper
+  wrap('beginDrawing', orig => function (opts) {
+    const ink = this.ctx.canvas._ink || null;
+    this._ink = ink; this._maskDepth = 0;
+    orig.call(this, ink ? { ...opts, background: ink.paper } : opts);
+    // text with no colour of its own would start out black
+    if (ink) this.ctx.fillStyle = this.ctx.strokeStyle = this.current.fillColor = this.current.strokeColor = ink.ink;
+  });
+  for (const name of ['setFillRGBColor', 'setStrokeRGBColor']) wrap(name, orig => function (r, g, b) {
+    if (this._ink && !this._maskDepth) [r, g, b] = this._ink.rgb(r, g, b);
+    orig.call(this, r, g, b);
+  });
+  // A soft mask's own drawing decides how see-through things are, so it must keep its real colours
+  wrap('beginGroup', orig => function (group) {
+    if (group && group.smask) this._maskDepth = (this._maskDepth || 0) + 1;
+    orig.call(this, group);
+  });
+  wrap('endGroup', orig => function (group) {
+    orig.call(this, group);
+    if (group && group.smask) this._maskDepth--;
+  });
+}
+// after a theme change: draw the pages again in the new colours, keeping the view where it was
+function pdfRepaint() {
+  const x = el.pdfwrap.scrollLeft, y = el.pdfwrap.scrollTop;
+  P.afterSwap = () => { el.pdfwrap.scrollLeft = x; el.pdfwrap.scrollTop = y; };
+  dropCache();
+  go(S.spread, false);
 }
 
 async function openPdf(buf, name) {
@@ -586,10 +687,10 @@ function dropJob(job) { job.then(div => { div._cached = false; if (!div.isConnec
 function dropCache() { for (const j of P.cache.values()) dropJob(j); P.cache.clear(); }
 
 function pdfPage(num) {
-  const key = num + ':' + P.pageH;
+  const key = num + ':' + P.pageH + ':' + prefs.theme;
   let job = P.cache.get(key);
   if (!job) {
-    const doc = P.doc, pageW = P.pageW, pageH = P.pageH;
+    const doc = P.doc, pageW = P.pageW, pageH = P.pageH, ink = pdfInk();
     job = (async () => {
       const page = await doc.getPage(num);
       const vp1 = page.getViewport({ scale: 1 });
@@ -599,6 +700,7 @@ function pdfPage(num) {
       const c = document.createElement('canvas');
       c.width = Math.floor(vp.width * dpr); c.height = Math.floor(vp.height * dpr);
       c.style.width = cw + 'px'; c.style.height = ch + 'px';
+      c._ink = ink;
       await page.render({ canvasContext: c.getContext('2d'), viewport: vp, transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null }).promise;
       const div = document.createElement('div');
       div.className = 'pg'; div.append(c);
@@ -977,7 +1079,11 @@ function resize(step) {
 }
 el.smaller.onclick = () => resize(-1);
 el.bigger.onclick = () => resize(1);
-el.theme.onclick = () => { prefs.theme = THEMES[(THEMES.indexOf(prefs.theme) + 1) % THEMES.length]; applyPrefs(); };
+el.theme.onclick = () => {
+  prefs.theme = THEMES[(THEMES.indexOf(prefs.theme) + 1) % THEMES.length];
+  applyPrefs();
+  if (S.ready && S.mode === 'pdf') pdfRepaint();
+};
 el.searchBtn.onclick = () => { if (el.searchRow.hidden) openSearch(); else closeSearch(); };
 el.searchDone.onclick = closeSearch;
 el.hitPrev.onclick = () => runSearch(-1);
@@ -1148,6 +1254,17 @@ if (location.hash.startsWith('#selftest-pdf=')) (async () => {
     out.pinchBackZoom = +P.zoom.toFixed(2); out.pinchBackScroll = [el.pdfwrap.scrollLeft, el.pdfwrap.scrollTop];
     el.bigger.onclick(); await settle(); out.plusZoom = P.zoom;
     el.smaller.onclick(); await settle(); out.minusZoom = P.zoom;
+
+    // themes: Night darkens the paper and lightens plain text by redrawing, with no filter laid over the page
+    const corner = () => { const c = el.pdfview.querySelector('canvas'); return [...c.getContext('2d').getImageData(2, 2, 1, 1).data.slice(0, 3)]; };
+    const darkest = () => { const c = el.pdfview.querySelector('canvas'), d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let m = 765; for (let i = 0; i < d.length; i += 4 * 7) m = Math.min(m, d[i] + d[i + 1] + d[i + 2]); return m; };
+    const themeTo = async t => { while (prefs.theme !== t) el.theme.onclick(); await settle(); };
+    await themeTo('paper'); out.paperCorner = corner();
+    await themeTo('night'); out.nightCorner = corner(); out.nightDarkestSum = darkest();
+    out.nightCssFilter = getComputedStyle(el.pdfview.querySelector('canvas')).filter;
+    out.nightKeptPage = shown()[0] === 3;
+    await themeTo('sepia'); out.sepiaCorner = corner();
+    await themeTo('paper'); out.paperAgainCorner = corner();
     out.done = true;
   } catch (e) { errors.push(String(e && e.stack || e)); }
   report(out, errors);

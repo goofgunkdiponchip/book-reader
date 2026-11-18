@@ -1,11 +1,12 @@
 // Keeps the reader working with no signal: everything is served from the phone's copy first,
 // and quietly refreshed in the background whenever there is a connection (updates show on the next launch).
-const CACHE = 'book-reader-v1';
+const CACHE = 'book-reader-v2';   // bump when files must change together: the phone then swaps them all at once
 const FILES = ['./', './index.html', './manifest.webmanifest', './lib/pdf.min.js', './lib/pdf.worker.min.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // 'reload' skips the browser's short-term copy, so a fresh install never mixes old and new files
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
